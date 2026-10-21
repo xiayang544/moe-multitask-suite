@@ -1,0 +1,44 @@
+[base]
+type = ml-easy-job
+
+[resource]
+usergroup = <your_usergroup>
+queue = <your_queue>
+
+[roles]
+workers = 1
+worker.memory = 640000
+worker.vcore = 64
+worker.gcores80g = 8
+worker.script = sh test_merged_smoke.sh
+worker.ports = 1
+
+[user_args]
+
+[am]
+afo.app.am.resource.mb = 4096
+
+[tensorboard]
+with.tensor.board = true
+board.log_dir = /path/to/moe-multitask-suite/test_smoke/test_merged_smoke_all/tensorboard
+
+[docker]
+afo.docker.image.name = <your_training_image_cuda12.2>
+
+[data]
+afo.data.prefetch = false
+
+[distribute]
+afo.use.torch = false
+
+[failover]
+afo.app.support.engine.failover = false
+afo.role.worker.task.attempt.max.retry = 1
+
+[config]
+
+[others]
+afo.app.env.YARN_CONTAINER_RUNTIME_DOCKER_SHM_SIZE_BYTES = 64424509440
+afo.xm.notice.receivers.account = <your_account>
+with_requirements = false
+afo.dolphinfs.otherusers = <your_usergroup>

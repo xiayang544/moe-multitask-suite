@@ -1,0 +1,1208 @@
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+
+from abc import ABC, abstractmethod
+from typing import Dict, Optional
+
+import torch
+import torch.nn as nn
+
+from megatron.core import parallel_state
+from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
+from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_utils import (
+    MoEAuxLossAutoScaler,
+    ProcessGroupCollection,
+    apply_random_logits,
+    apply_router_token_dropping,
+    compute_routing_scores_for_aux_loss,
+    router_gating_linear,
+    save_to_aux_losses_tracker,
+    sinkhorn,
+    switch_load_balancing_loss_func,
+    topk_routing_with_score_function,
+    z_loss_func,
+)
+from megatron.core.transformer.transformer_config import TransformerConfig
+
+# ---------------------------------------------------------------------------
+# Task-conditioned router – design notes
+# ---------------------------------------------------------------------------
+# task_bias  : nn.Embedding(num_tasks, num_experts)   – bias / bias_plus_proj
+# task_emb   : nn.Embedding(num_tasks, emb_dim)       – bias_plus_proj / emb_proj_only
+# task_proj  : nn.Linear(emb_dim, num_experts, bias=False) – bias_plus_proj / emb_proj_only
+#
+# Mode summary:
+#   'bias'          : task_term = task_bias(task_id)
+#   'bias_plus_proj': task_term = task_bias(task_id) + task_proj(task_emb(task_id))
+#   'emb_proj_only' : task_term = task_proj(task_emb(task_id))  [no task_bias]
+#
+# These are standard nn.Module sub-modules, so they enter state_dict() /
+# Megatron distributed checkpoint automatically without any extra plumbing.
+#
+# extra_state stores ONLY metadata (ints / strings), never trainable tensors.
+# ---------------------------------------------------------------------------
+
+_TASK_ROUTER_VERSION = 1  # bump when the layout changes incompatibly
+
+
+class Router(ABC, MegatronModule):
+    """Base Router class"""
+
+    def __init__(
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+    ) -> None:
+        """
+        Initialize the Router module.
+
+        Args:
+            config (TransformerConfig): Configuration object for the Transformer model.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+        """
+        super().__init__(config)
+        self.config = config
+        self.num_experts = self.config.num_moe_experts
+        self.moe_aux_loss_func = None
+        self.layer_number = None
+        self.tp_group = pg_collection.tp
+        self.cp_group = pg_collection.cp
+        self.tp_cp_group = pg_collection.tp_cp
+        self.tp_dp_cp_group = pg_collection.tp_dp_cp
+
+        # Initialize the gate weights.
+        # TODO: Add support for GPU initialization, which requires updating the golden values.
+        self.weight = torch.nn.Parameter(
+            torch.empty((self.config.num_moe_experts, self.config.hidden_size), dtype=torch.float32)
+        )
+        if self.config.add_bias_linear:
+            self.bias = torch.nn.Parameter(
+                torch.empty((self.config.num_moe_experts), dtype=torch.float32)
+            )
+        else:
+            self.bias = None
+        # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
+        # So we need to know if the model is configured to calculate per token loss.
+        self.calculate_per_token_loss = self.config.calculate_per_token_loss
+        self.reset_parameters()
+
+        # ------------------------------------------------------------------ #
+        # Task-conditioned router parameters                                  #
+        # ------------------------------------------------------------------ #
+        # All task-related parameters are registered as proper nn.Module
+        # sub-modules (nn.Embedding / nn.Linear) so they are automatically
+        # included in state_dict() and Megatron distributed checkpoints.
+        # No separate .pt file is needed or written.
+        self._task_condition_enabled = self.config.moe_use_task_condition
+        if self._task_condition_enabled:
+            _num_tasks: int = self.config.num_tasks
+            _num_experts: int = self.config.num_moe_experts
+            _mode: str = self.config.task_router_mode
+
+            if _mode in ("bias", "bias_plus_proj"):
+                # task_bias: nn.Embedding(num_tasks, num_experts) – zero-init
+                self.task_bias = nn.Embedding(_num_tasks, _num_experts)
+                nn.init.zeros_(self.task_bias.weight)
+            else:
+                # emb_proj_only: no task_bias
+                self.task_bias = None
+
+            if _mode in ("bias_plus_proj", "emb_proj_only"):
+                _emb_dim: int = self.config.task_router_emb_dim
+                # task_emb: nn.Embedding(num_tasks, emb_dim) – small normal init
+                self.task_emb = nn.Embedding(_num_tasks, _emb_dim)
+                nn.init.normal_(self.task_emb.weight, mean=0.0, std=0.02)
+                # task_proj: nn.Linear(emb_dim, num_experts) – zero-init
+                self.task_proj = nn.Linear(_emb_dim, _num_experts, bias=False)
+                nn.init.zeros_(self.task_proj.weight)
+            else:
+                self.task_emb = None
+                self.task_proj = None
+        else:
+            self.task_bias = None
+            self.task_emb = None
+            self.task_proj = None
+
+    def reset_parameters(self):
+        """Reset the router parameters."""
+        if self.config.perform_initialization:
+            self.config.init_method(self.weight)
+        self.weight.data = self.weight.data.to(dtype=self.config.params_dtype)
+        setattr(self.weight, 'sequence_parallel', self.config.sequence_parallel)
+        if self.bias is not None:
+            self.bias.data = self.bias.data.to(dtype=self.config.params_dtype)
+            setattr(self.bias, 'sequence_parallel', self.config.sequence_parallel)
+
+    def gating(self, input: torch.Tensor):
+        """Forward pass of the router gate.
+
+        Args:
+            input (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Logits tensor.
+        """
+        if self.weight.device.type == 'cpu':
+            # move weights to GPU
+            self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+        if self.bias is not None and self.bias.device.type == 'cpu':
+            self.bias.data = self.bias.data.to(device=torch.cuda.current_device())
+
+        # Convert to specified datatype for routing computation if enabled
+        router_dtype = input.dtype
+        if self.config.moe_router_dtype == 'fp32':
+            router_dtype = torch.float32
+        elif self.config.moe_router_dtype == 'fp64':
+            router_dtype = torch.float64
+        logits = router_gating_linear(input, self.weight, self.bias, router_dtype)
+        return logits
+
+    @abstractmethod
+    def routing(self, logits: torch.Tensor):
+        """Routing function.
+
+        Args:
+            logits (torch.Tensor): Logits tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing token assignment
+            probabilities and mapping.
+        """
+        raise NotImplementedError("Routing function not implemented.")
+
+    @abstractmethod
+    def forward(self, input: torch.Tensor, task_ids: Optional[torch.Tensor] = None):
+        """
+        Forward pass of the router.
+
+        Args:
+            input (torch.Tensor): Input tensor.
+            task_ids (torch.Tensor, optional): Long tensor of shape [seq, bsz] or [T]
+                containing per-token task IDs.  Required when
+                ``moe_use_task_condition`` is True.
+        """
+        raise NotImplementedError("Forward function not implemented.")
+
+    def set_layer_number(self, layer_number: int):
+        """Set the layer number for the router."""
+        self.layer_number = layer_number
+
+    # ------------------------------------------------------------------ #
+    # extra_state: metadata-only (NO trainable tensors stored here)       #
+    # ------------------------------------------------------------------ #
+
+    def get_extra_state(self) -> Optional[Dict]:
+        """Return metadata about the task-conditioned router config.
+
+        This is called by Megatron's checkpoint machinery and ends up in
+        the distributed checkpoint alongside the weight tensors.  We store
+        only non-tensor metadata here; the actual trainable tensors
+        (task_bias.weight, task_emb.weight, task_proj.weight) are saved
+        through the normal state_dict() path.
+        """
+        if not self._task_condition_enabled:
+            return None
+        return {
+            "task_router_version": _TASK_ROUTER_VERSION,
+            "moe_use_task_condition": True,
+            "num_tasks": self.config.num_tasks,
+            "task_router_mode": self.config.task_router_mode,
+            "task_router_emb_dim": self.config.task_router_emb_dim,
+        }
+
+    def set_extra_state(self, state: Optional[Dict]) -> None:
+        """Restore metadata.  Called on checkpoint load.
+
+        We only validate version compatibility; the actual parameter values
+        are restored by the standard ``load_state_dict`` path.
+        """
+        if state is None:
+            # Old checkpoint without task-condition support – silently ignore
+            return
+        version = state.get("task_router_version", 0)
+        if version > _TASK_ROUTER_VERSION:
+            raise RuntimeError(
+                f"[task router] Checkpoint version {version} is newer than "
+                f"code version {_TASK_ROUTER_VERSION}. Please update the code."
+            )
+
+
+class TopKRouter(Router):
+    """Route each token to the top-k experts.
+
+    The workflow of TopKRouter is as follows:
+    (1) Calculate the logits by the router gating network.
+    (2) Calculate the routing probabilities and map for top-k selection with score function.
+    (3) [Optional] Apply token dropping to top-k expert selection.
+    (4) [Optional] Apply the auxiliary load balancing loss for the given scores and routing map.
+
+    Naming convention:
+        logits: The output logits by the router gating network.
+        scores: The scores after score function used to select the experts and calculate aux loss.
+        probs: The topk weights used to combined the experts' outputs.
+        routing_map: The masked routing map between tokens and experts.
+    """
+
+    def __init__(
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
+    ) -> None:
+        """Initialize the zero token dropping router.
+
+        Args:
+            config (TransformerConfig): The configuration for the transformer model.
+            pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
+        """
+        super().__init__(config=config, pg_collection=pg_collection)
+        self.topk = self.config.moe_router_topk
+        self.routing_type = self.config.moe_router_load_balancing_type
+        self.score_function = self.config.moe_router_score_function
+        self.input_jitter = None
+
+        self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        if self.enable_expert_bias:
+            self.register_buffer(
+                'local_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'expert_bias',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+        else:
+            self.local_tokens_per_expert = None
+            self.expert_bias = None
+
+        # Initialize global tokens per expert for global aux loss
+        if self.get_aux_loss_coeff("global_aux_loss") > 0:
+            self.register_buffer(
+                'global_tokens_per_expert',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'ga_steps',
+                torch.tensor(0, dtype=torch.float32, device=torch.cuda.current_device()),
+                persistent=False,
+            )
+        else:
+            self.global_tokens_per_expert = None
+            self.ga_steps = None
+
+    def _maintain_float32_expert_bias(self):
+        """
+        Maintain the expert bias in float32.
+
+        When using bf16/fp16, the expert bias gets converted to lower precision in Float16Module.
+        We keep it in float32 to avoid routing errors when updating the expert_bias.
+        """
+        if hasattr(self, 'expert_bias') and self.expert_bias is not None:
+            if self.expert_bias.dtype != torch.float32:
+                self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+
+    def sinkhorn_load_balancing(self, logits: torch.Tensor):
+        """Apply sinkhorn routing to the logits tensor.
+
+        Args:
+            logits (torch.Tensor): The logits tensor.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing token assignment
+            probabilities and mask.
+        """
+
+        def _sinkhorn_activation(logits):
+            if self.topk == 1:
+                logits = torch.sigmoid(logits)
+            else:  # k > 1
+                logits = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            return logits
+
+        assert self.config.moe_aux_loss_coeff == 0, "Sinkhorn routing does not support aux loss."
+        if self.training:
+            with torch.no_grad():
+                norm_logits = sinkhorn(
+                    logits.to(dtype=torch.float32)
+                )  # explicit fp32 conversion for stability
+                _, indices = torch.topk(norm_logits, k=self.topk, dim=1)
+            logits = _sinkhorn_activation(logits)
+        else:
+            logits = _sinkhorn_activation(logits)
+            _, indices = torch.topk(logits, k=self.topk, dim=1)
+        map = torch.zeros_like(logits).int().scatter(1, indices, 1).bool()
+        scores = logits * map
+        return scores, map
+
+    def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
+        """Return the aux loss coeff for the given auxiliary loss type.
+        If the auxiliary loss type is not found, return 0.0.
+        """
+        if isinstance(self.routing_type, str):
+            if self.routing_type == aux_loss_type:
+                return self.config.moe_aux_loss_coeff
+        if isinstance(self.routing_type, list):
+            try:
+                idx = self.routing_type.index(aux_loss_type)
+                return self.config.moe_aux_loss_coeff[idx]
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    def is_aux_loss_enabled(self) -> bool:
+        """Check if the auxiliary loss is enabled."""
+        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
+            if self.get_aux_loss_coeff(aux_loss_type) > 0:
+                return True
+        return False
+
+    def _apply_aux_loss(
+        self, probs: torch.Tensor, scores_for_aux_loss: torch.Tensor, routing_map: torch.Tensor
+    ):
+        """Apply the auxiliary loss for the given scores and routing map."""
+        aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
+        if aux_loss_coeff == 0:
+            return probs
+        tokens_per_expert = routing_map.sum(dim=0)
+        tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            tokens_per_expert, self.tp_cp_group
+        )
+        num_tokens = routing_map.shape[0]
+        total_num_tokens = num_tokens * self.tp_cp_group.size()
+
+        aux_loss = switch_load_balancing_loss_func(
+            probs=scores_for_aux_loss,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=self.topk,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=aux_loss_coeff,
+            fused=self.config.moe_router_fusion,
+        )
+        probs = self.attach_and_log_load_balancing_loss(
+            probs, aux_loss_coeff, aux_loss, "load_balancing_loss", self.tp_cp_group
+        )
+        return probs
+
+    def _apply_seq_aux_loss(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        seq_length: int,
+        bsz: int,
+    ):
+        """Apply the sequence-level auxiliary loss for the given scores and routing map.
+
+        To calculate the sequence-level aux loss, we reshape the batch_size dimension to
+        experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
+        to the sum of aux loss for each sequence in the batch. And then we divide the aux
+        loss by the batch size to get averaged aux loss.
+        """
+        seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
+        if seq_aux_loss_coeff == 0:
+            return probs
+
+        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
+        tokens_per_expert = routing_map.reshape(seq_length, -1).sum(dim=0)
+        tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            tokens_per_expert, self.tp_cp_group
+        )
+
+        total_num_tokens = seq_length * self.tp_cp_group.size()
+
+        aux_loss = (
+            switch_load_balancing_loss_func(
+                probs=scores_for_aux_loss,
+                tokens_per_expert=tokens_per_expert,
+                total_num_tokens=total_num_tokens,
+                topk=self.topk,
+                num_experts=self.config.num_moe_experts,
+                moe_aux_loss_coeff=seq_aux_loss_coeff,
+                fused=self.config.moe_router_fusion,
+            )
+            / bsz
+        )
+        probs = self.attach_and_log_load_balancing_loss(
+            probs, seq_aux_loss_coeff, aux_loss, "seq_load_balancing_loss", self.tp_cp_group
+        )
+        return probs
+
+    def _apply_global_aux_loss(
+        self, probs: torch.Tensor, scores_for_aux_loss: torch.Tensor, routing_map: torch.Tensor
+    ):
+        """Apply the global auxiliary loss for the given scores and routing map."""
+        global_aux_loss_coeff = self.get_aux_loss_coeff("global_aux_loss")
+        if global_aux_loss_coeff == 0:
+            return probs
+
+        tokens_per_expert = routing_map.sum(dim=0)
+        tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            tokens_per_expert, self.tp_dp_cp_group
+        )
+
+        self.global_tokens_per_expert += tokens_per_expert
+        self.ga_steps += 1
+        averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
+
+        num_tokens = scores_for_aux_loss.shape[0]
+        total_num_tokens = num_tokens * self.tp_dp_cp_group.size()
+
+        global_aux_loss = switch_load_balancing_loss_func(
+            probs=scores_for_aux_loss,
+            tokens_per_expert=averated_tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=self.topk,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=global_aux_loss_coeff,
+            fused=self.config.moe_router_fusion,
+        )
+        probs = self.attach_and_log_load_balancing_loss(
+            probs,
+            global_aux_loss_coeff,
+            global_aux_loss,
+            "global_load_balancing_loss",
+            self.tp_dp_cp_group,
+        )
+        return probs
+
+    def attach_and_log_load_balancing_loss(
+        self,
+        activation: torch.Tensor,
+        aux_loss_coeff: float,
+        aux_loss: torch.Tensor,
+        aux_loss_name: str,
+        reduce_group: torch.distributed.ProcessGroup,
+    ):
+        """Attach aux loss function to activation and add to logging."""
+        # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
+        # add the aux loss logging value to other layer's since it is difficult to get the
+        # correct layer_number for MTP. It does not affect the correctness of the calculation
+        # results and the reduced load_balancing_loss logging value.
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        save_to_aux_losses_tracker(
+            aux_loss_name,
+            aux_loss / aux_loss_coeff,
+            self.layer_number,
+            num_layers,
+            reduce_group=reduce_group,
+        )
+        if self.calculate_per_token_loss:
+            # Scale the aux_loss by the number of tokens.
+            # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
+            # After commit 02648000, Megatron started using the number of total tokens to scale
+            # gradients under the argument of calculate_per_token_loss,
+            # which scales both the main_loss gradient and aux_loss gradient by
+            # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads function.
+            # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
+            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss * activation.shape[0])
+        else:
+            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
+        return activation
+
+    def apply_z_loss(self, logits):
+        """Encourages the router's logits to remain small to enhance stability.
+        Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
+
+        Args:
+            logits (torch.Tensor): The logits of the router.
+
+        Returns:
+            torch.Tensor: The logits after applying the z-loss.
+        """
+        if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
+            # Skip Z loss calculations when using torch.no_grad() or checkpointing.
+            moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
+            z_loss = z_loss_func(logits, moe_z_loss_coeff)
+            scale_up = 1.0
+            if self.calculate_per_token_loss:
+                # The expected final scaling for z_loss gradients is
+                # 1/(num_micro_batches * dp_size).
+                # After commit 02648000, Megatron started using the number of total tokens
+                # to scale gradients under the argument of calculate_per_token_loss,
+                # which scales both the main_loss gradient and z_loss gradient by
+                # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
+                # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
+                logits = MoEAuxLossAutoScaler.apply(logits, z_loss * logits.shape[0])
+            else:
+                logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
+            save_to_aux_losses_tracker(
+                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, num_layers
+            )
+        return logits
+
+    def apply_input_jitter(self, input: torch.Tensor):
+        """Add noise to the input tensor.
+        Refer to https://arxiv.org/abs/2101.03961.
+
+        Args:
+            input (Tensor): Input tensor.
+
+        Returns:
+            Tensor: Jittered input.
+        """
+        if self.config.moe_input_jitter_eps is not None:
+            eps = self.config.moe_input_jitter_eps
+            if self.input_jitter is None:
+                self.input_jitter = torch.distributions.uniform.Uniform(
+                    torch.tensor(1.0 - eps, dtype=input.dtype, device=input.device),
+                    torch.tensor(1.0 + eps, dtype=input.dtype, device=input.device),
+                ).rsample
+            return input * self.input_jitter(input.shape)
+        else:
+            return input
+
+    def reset_global_aux_loss_tracker(self):
+        """Reset the global aux loss tracker."""
+        if self.global_tokens_per_expert is not None:
+            self.global_tokens_per_expert.zero_()
+            self.ga_steps.zero_()
+
+    # ------------------------------------------------------------------ #
+    # Task-conditioned logit correction                                   #
+    # ------------------------------------------------------------------ #
+
+    def _compute_task_term(
+        self, logits_2d: torch.Tensor, task_ids_1d: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute the task-conditioned logit correction.
+
+        Formula:
+            bias_only:       task_term = task_bias(task_ids)
+            bias_plus_proj:  task_term = task_bias(task_ids)
+                                        + task_proj(task_emb(task_ids))
+
+        Args:
+            logits_2d:   [T, num_experts] – base router logits (for dtype/device ref)
+            task_ids_1d: [T] long tensor
+
+        Returns:
+            task_term [T, num_experts] cast to logits_2d.dtype
+        """
+        ids = task_ids_1d.long().to(logits_2d.device)
+        if self.task_bias is not None:
+            task_term = self.task_bias(ids)  # [T, E]
+        else:
+            task_term = torch.zeros(
+                ids.shape[0], logits_2d.shape[-1],
+                dtype=logits_2d.dtype, device=logits_2d.device
+            )
+        if self.task_emb is not None and self.task_proj is not None:
+            task_term = task_term + self.task_proj(self.task_emb(ids))  # [T, E]
+        return task_term.to(logits_2d.dtype)
+
+    def _align_task_ids_to_tokens(
+        self,
+        task_ids: Optional[torch.Tensor],
+        num_local_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        """Flatten task_ids and align to the local token count seen by this rank.
+
+        The router receives ``num_local_tokens`` tokens.  ``task_ids`` may carry
+        the full global sequence (e.g. shape [seq, bsz]) before any TP split has
+        been applied.  This helper:
+
+        1. Flattens task_ids to 1-D.
+        2. If the flat length matches ``num_local_tokens`` exactly – no-op.
+        3. If the flat length is a multiple of ``num_local_tokens`` – assumes the
+           full [seq * bsz] tensor and slices the TP-rank-local chunk.
+        4. Otherwise returns None (shape mismatch cannot be auto-resolved).
+
+        Alignment is done here, immediately before the router's logit computation,
+        so the slicing is guaranteed to match the actual token layout the router
+        sees regardless of whether the caller pre-sliced or not.
+        """
+        if task_ids is None:
+            return None
+        task_ids_1d = task_ids.reshape(-1)
+        if task_ids_1d.shape[0] == num_local_tokens:
+            return task_ids_1d
+        if task_ids_1d.shape[0] % num_local_tokens == 0:
+            tp_rank = parallel_state.get_tensor_model_parallel_rank()
+            return task_ids_1d[tp_rank * num_local_tokens : (tp_rank + 1) * num_local_tokens]
+        # Unresolvable mismatch – skip task conditioning silently.
+        return None
+
+    def _apply_task_condition(
+        self,
+        logits: torch.Tensor,
+        task_ids_1d: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Add the task-conditioned term to router logits.
+
+        Args:
+            logits:      shape [T, E] – already-flattened router logits.
+            task_ids_1d: [T] long tensor aligned to logits, or None.
+
+        Returns:
+            logits with task term added (same shape as input).
+        """
+        if not self._task_condition_enabled or task_ids_1d is None:
+            return logits
+        task_term = self._compute_task_term(logits, task_ids_1d)  # [T, E]
+        return logits + task_term
+
+    def _apply_task_overlap_loss(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        task_ids_1d: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply cross-task expert overlap auxiliary loss.
+
+        For each pair of tasks (i, j), the overlap loss encourages the soft routing
+        distributions to be orthogonal:
+            L_overlap = sum_{i<j} sum_e [ P_i(e) * P_j(e) ]
+        where P_t(e) = mean softmax-prob for task t on expert e (over local tokens).
+
+        Args:
+            probs:        [T, E] softmax probs (already topk-masked).
+            routing_map:  [T, E] bool routing map.
+            task_ids_1d:  [T] long tensor, or None.
+
+        Returns:
+            probs with overlap loss grad attached (or unchanged if disabled).
+        """
+        overlap_coeff = getattr(self.config, 'moe_task_overlap_aux_coeff', 0.0)
+        # Align with standard Megatron aux loss pattern: only compute when
+        # training with grad enabled.  This ensures correct behavior both with
+        # activation checkpointing (recompute pass) and without it (single
+        # forward pass).  No double-counting occurs because the no-grad forward
+        # pass under checkpointing skips this block entirely.
+        if not (self.training and overlap_coeff > 0.0 and torch.is_grad_enabled()):
+            return probs
+
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+
+        # --------------------------------------------------------------
+        # Cross-rank consistency:
+        #
+        # reduce_aux_losses_tracker_across_ranks() reads
+        # tracker['task_overlap_loss']['reduce_group'] and conditionally issues
+        # `all_reduce(values, group=reduce_group)`.  That collective is
+        # collective across tp_cp_group ranks - so every rank in the group must
+        # either all issue it or all skip it, otherwise we deadlock.
+        #
+        # With sequence_parallel=True each TP rank sees a DIFFERENT sequence
+        # slice, so it is entirely possible for one TP rank's local slice to
+        # contain only one task (num_pairs == 0) while its peer sees both
+        # (num_pairs > 0).  If we returned early here without touching the
+        # tracker, force_initialize in track_moe_metrics would leave
+        # reduce_group=None on the "num_pairs==0" rank, while the peer has
+        # reduce_group=tp_cp_group -> cross-rank hang.
+        #
+        # Fix: always register the tracker with reduce_group=tp_cp_group on
+        # every rank that reaches this point, using a zero loss when there is
+        # no overlap pair to compute locally.  The values are summed across
+        # the TP group anyway, so contributing zero from a rank that has no
+        # pairs is numerically correct.
+        # --------------------------------------------------------------
+        def _register_zero_and_return():
+            save_to_aux_losses_tracker(
+                "task_overlap_loss",
+                probs.new_zeros([], dtype=torch.float).detach(),
+                self.layer_number,
+                num_layers,
+                reduce_group=self.tp_cp_group,
+            )
+            return probs
+
+        if task_ids_1d is None:
+            return _register_zero_and_return()
+
+        # Determine num_tasks with fallback chain:
+        #   1. config.num_tasks (most reliable; set via --num_tasks CLI arg)
+        #   2. task_bias.num_embeddings (if task conditioning is enabled)
+        #   3. max(task_ids) + 1 (last resort; may under-count if some tasks
+        #      are absent from this micro-batch)
+        _cfg_num_tasks = getattr(self.config, 'num_tasks', 0)
+        if _cfg_num_tasks and _cfg_num_tasks > 0:
+            num_tasks = _cfg_num_tasks
+        elif self.task_bias is not None:
+            num_tasks = self.task_bias.num_embeddings
+        else:
+            num_tasks = int(task_ids_1d.max().item()) + 1
+        probs_float = probs.float()
+        task_probs = []
+        for t in range(num_tasks):
+            mask = (task_ids_1d == t)
+            if mask.sum() == 0:
+                task_probs.append(None)
+            else:
+                task_probs.append(probs_float[mask].mean(dim=0))  # [E]
+
+        overlap_loss = probs_float.new_zeros([])
+        num_pairs = 0
+        for i in range(num_tasks):
+            for j in range(i + 1, num_tasks):
+                if task_probs[i] is not None and task_probs[j] is not None:
+                    overlap_loss = overlap_loss + (task_probs[i] * task_probs[j]).sum()
+                    num_pairs += 1
+        if num_pairs == 0:
+            return _register_zero_and_return()
+
+        overlap_loss = overlap_loss / num_pairs * overlap_coeff
+
+        save_to_aux_losses_tracker(
+            "task_overlap_loss",
+            overlap_loss.detach() / overlap_coeff,
+            self.layer_number,
+            num_layers,
+            reduce_group=self.tp_cp_group,
+        )
+        if self.calculate_per_token_loss:
+            probs = MoEAuxLossAutoScaler.apply(probs, overlap_loss * probs.shape[0])
+        else:
+            probs = MoEAuxLossAutoScaler.apply(probs, overlap_loss)
+        return probs
+
+    # ---------------------------------------------------------------------- #
+    # OT-based cross-task expert separation loss                              #
+    # ---------------------------------------------------------------------- #
+
+    @staticmethod
+    def _compute_sinkhorn_cost(
+        pA: torch.Tensor,
+        pB: torch.Tensor,
+        log_K: torch.Tensor,
+        C: torch.Tensor,
+        log_pA: torch.Tensor,
+        log_pB: torch.Tensor,
+        max_iters: int = 20,
+    ) -> torch.Tensor:
+        """Compute the raw entropy-regularized Sinkhorn cost W_{c,eps}(pA, pB)
+        using the log-domain algorithm.
+
+        This is a low-level building block; callers should generally use
+        ``_compute_sinkhorn_divergence`` which subtracts the self-transport
+        bias.
+
+        Args:
+            pA, pB:   [E] normalised distributions (caller must pre-normalise).
+            log_K:    [E, E] pre-computed log Gibbs kernel  = -C / epsilon.
+            C:        [E, E] cost matrix.
+            log_pA, log_pB: [E] pre-computed log distributions.
+            max_iters: Sinkhorn iterations.
+
+        Returns:
+            Scalar tensor: W_{c,eps}(pA, pB).
+        """
+        E = pA.size(0)
+        log_u = torch.zeros(E, dtype=pA.dtype, device=pA.device)
+        log_v = torch.zeros(E, dtype=pA.dtype, device=pA.device)
+
+        for _ in range(max_iters):
+            log_u = log_pA - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
+            log_v = log_pB - torch.logsumexp(log_K + log_u.unsqueeze(1), dim=0)
+
+        log_P = log_u.unsqueeze(1) + log_K + log_v.unsqueeze(0)
+        P = torch.exp(log_P)
+        return torch.sum(P * C)
+
+    @staticmethod
+    def _compute_sinkhorn_divergence(
+        pA: torch.Tensor,
+        pB: torch.Tensor,
+        C: torch.Tensor,
+        epsilon: float = 0.5,
+        max_iters: int = 20,
+        self_cost_cache: Optional[Dict] = None,
+    ) -> torch.Tensor:
+        """Compute the Sinkhorn *divergence* between two routing distributions.
+
+        The Sinkhorn divergence removes the entropy-regularisation bias that
+        makes the raw Sinkhorn cost W_eps(p, p) ≠ 0:
+
+            S_eps(p, q) = W_eps(p, q) − 0.5 * (W_eps(p, p) + W_eps(q, q))
+
+        This ensures S_eps(p, p) = 0, so the metric actually reflects
+        distributional *difference* rather than distributional *entropy*.
+        See Genevay et al. (2018) "Learning Generative Models with Sinkhorn
+        Divergences".
+
+        Without the debiasing correction the raw cost W_eps on the real 128-
+        expert router with eps=0.5 gives ~0.49 for uniform-vs-uniform (should
+        be 0) and ~0.31 for identical-vs-identical sharp distributions, making
+        it impossible to set a meaningful margin and rendering the OT loss
+        ineffective -- this was the root cause of v0-v3 failures.
+
+        ``self_cost_cache`` is an optional dict mapping distribution id (e.g.
+        task index) to the pre-computed W_eps(p, p).  Callers should pass a
+        shared dict across pairs so that each task's self-cost is computed only
+        once (5 tasks → 5 self-costs cached, saving ~50% Sinkhorn calls).
+
+        Args:
+            pA, pB:  [E] non-negative distributions (re-normalised internally).
+            C:       [E, E] cost matrix.
+            epsilon: Entropy regularisation coefficient.
+            max_iters: Sinkhorn iterations.
+            self_cost_cache: Optional shared cache dict. Keys should be unique
+                per-distribution objects (e.g. ``id(pA)``). Mutated in-place.
+
+        Returns:
+            Scalar tensor: S_eps(pA, pB)  (≥ 0, = 0 iff pA == pB).
+        """
+        pA = pA + 1e-8
+        pA = pA / pA.sum()
+        pB = pB + 1e-8
+        pB = pB / pB.sum()
+
+        log_K = -C / epsilon
+        log_pA = torch.log(pA)
+        log_pB = torch.log(pB)
+
+        _cost = TopKRouter._compute_sinkhorn_cost
+
+        W_AB = _cost(pA, pB, log_K, C, log_pA, log_pB, max_iters)
+
+        if self_cost_cache is not None:
+            id_A = id(pA)
+            id_B = id(pB)
+            if id_A not in self_cost_cache:
+                self_cost_cache[id_A] = _cost(pA, pA, log_K, C, log_pA, log_pA, max_iters)
+            if id_B not in self_cost_cache:
+                self_cost_cache[id_B] = _cost(pB, pB, log_K, C, log_pB, log_pB, max_iters)
+            W_AA = self_cost_cache[id_A]
+            W_BB = self_cost_cache[id_B]
+        else:
+            W_AA = _cost(pA, pA, log_K, C, log_pA, log_pA, max_iters)
+            W_BB = _cost(pB, pB, log_K, C, log_pB, log_pB, max_iters)
+
+        return W_AB - 0.5 * (W_AA + W_BB)
+
+    def _apply_task_ot_sep_loss(
+        self,
+        probs: torch.Tensor,
+        routing_map: torch.Tensor,
+        task_ids_1d: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply OT-based cross-task expert separation loss using Sinkhorn
+        *divergence* (debiased) with margin-relu saturation.
+
+        For each pair of tasks (i, j), compute the Sinkhorn divergence
+        S_eps between their mean routing distributions:
+
+            S_eps(p, q) = W_eps(p, q) - 0.5 * (W_eps(p, p) + W_eps(q, q))
+
+        then penalise pairs whose divergence is below the margin:
+
+            L_ot = coeff * mean_{i<j} relu(margin - S_eps(p̄^i, p̄^j))
+
+        Why divergence instead of raw Sinkhorn distance:
+          The raw W_eps(p, q) contains an entropy-regularisation offset that
+          makes W_eps(p, p) ≈ 0.30–0.49 (depending on how uniform p is).
+          This offset is *larger* than any reasonable margin, so the relu was
+          always saturated (grad=0) regardless of coeff -- the root cause of
+          the v0–v3 failures diagnosed by debug_ot_sep_loss.py.
+          S_eps satisfies S_eps(p, p) = 0 by construction, so the margin
+          operates on genuine distributional difference.
+
+        Self-cost caching: each task's W_eps(p_t, p_t) is computed once and
+        reused across all pairs involving task t, so the total Sinkhorn calls
+        are num_tasks + C(num_tasks, 2) instead of 3 * C(num_tasks, 2).
+
+        Args:
+            probs:        [T, E] softmax probs (already topk-masked).
+            routing_map:  [T, E] bool routing map.
+            task_ids_1d:  [T] long tensor, or None.
+
+        Returns:
+            probs with OT separation loss grad attached (or unchanged if
+            disabled / no valid pairs).
+        """
+        import torch.nn.functional as F  # local import to avoid circular deps
+
+        ot_coeff = getattr(self.config, 'moe_task_ot_sep_coeff', 0.0)
+        if not (self.training and ot_coeff > 0.0 and torch.is_grad_enabled()):
+            return probs
+
+        epsilon = float(getattr(self.config, 'moe_task_ot_sep_epsilon', 0.5))
+        margin = float(getattr(self.config, 'moe_task_ot_sep_margin', 0.5))
+
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+
+        # ------------------------------------------------------------------
+        # Cross-rank consistency (same pattern as _apply_task_overlap_loss):
+        # Always register the tracker entry with reduce_group set so that
+        # every TP rank participates in the all_reduce, even when the local
+        # sequence slice contains only one task (zero loss contribution).
+        # ------------------------------------------------------------------
+        def _register_zero_and_return():
+            save_to_aux_losses_tracker(
+                "task_ot_sep_loss",
+                probs.new_zeros([], dtype=torch.float).detach(),
+                self.layer_number,
+                num_layers,
+                reduce_group=self.tp_cp_group,
+            )
+            return probs
+
+        if task_ids_1d is None:
+            return _register_zero_and_return()
+
+        # Determine num_tasks with fallback chain:
+        #   1. config.num_tasks (most reliable; set via --num_tasks CLI arg)
+        #   2. task_bias.num_embeddings (if task conditioning is enabled)
+        #   3. max(task_ids) + 1 (last resort; may under-count if some tasks
+        #      are absent from this micro-batch)
+        _cfg_num_tasks = getattr(self.config, 'num_tasks', 0)
+        if _cfg_num_tasks and _cfg_num_tasks > 0:
+            num_tasks = _cfg_num_tasks
+        elif self.task_bias is not None:
+            num_tasks = self.task_bias.num_embeddings
+        else:
+            num_tasks = int(task_ids_1d.max().item()) + 1
+
+        probs_float = probs.float()
+        task_probs = []
+        for t in range(num_tasks):
+            mask = (task_ids_1d == t)
+            if mask.sum() == 0:
+                task_probs.append(None)
+            else:
+                task_probs.append(probs_float[mask].mean(dim=0))  # [E]
+
+        # Build cost matrix from Router weight cosine distances (detached).
+        W = self.weight.float()  # [E, hidden_size]
+        W_norm = F.normalize(W, p=2, dim=1)  # [E, hidden_size]
+        cosine_sim = torch.matmul(W_norm, W_norm.t())  # [E, E]
+        C = (1.0 - cosine_sim).clamp(min=0.0).detach()  # [E, E], zero diagonal
+
+        # Optional: rank-normalise C to amplify structural signals.
+        # By default Qwen3-30B-A3B router weights are near-orthogonal in
+        # high-dimensional space, making C ≈ constant (rank-1, CV≈0.11).
+        # Rank normalisation: map off-diagonal elements to [0,1] by their
+        # rank order (order-preserving), yielding CV≈0.58.  This avoids
+        # the sign-flip issue of contrast normalisation (S_eps < 0 bug)
+        # while expanding the dynamic range of C.
+        # When enabled, set epsilon ≈ 0.5 (not 0.1) to match the new C scale.
+        # Enable with --moe_task_ot_sep_c_normalize true.
+        _c_normalize = getattr(self.config, 'moe_task_ot_sep_c_normalize', False)
+        if _c_normalize:
+            _E = C.shape[0]
+            _off_diag_mask = ~torch.eye(_E, dtype=torch.bool, device=C.device)
+            _c_vals = C[_off_diag_mask]  # [(E*E - E)] off-diagonal values
+            # argsort twice gives ranks in [0, N-1]
+            _n = _c_vals.shape[0]
+            _ranks = torch.argsort(torch.argsort(_c_vals)).float()
+            _ranks_norm = _ranks / (_n - 1)  # map to [0, 1]
+            C = torch.zeros_like(C)
+            C[_off_diag_mask] = _ranks_norm
+            # diagonal stays 0 (already zero from zeros_like)
+
+        # Shared cache for self-transport costs W_eps(p_t, p_t).
+        # Each task's self-cost is computed once; 5 tasks → 5 calls cached.
+        self_cost_cache: Dict = {}
+
+        div_sum = probs_float.new_zeros([])       # sum of divergences (for logging)
+        margin_loss_sum = probs_float.new_zeros([])  # sum of relu(margin - div) (for grad)
+        num_pairs = 0
+        for i in range(num_tasks):
+            for j in range(i + 1, num_tasks):
+                if task_probs[i] is not None and task_probs[j] is not None:
+                    div = TopKRouter._compute_sinkhorn_divergence(
+                        task_probs[i], task_probs[j], C,
+                        epsilon=epsilon, self_cost_cache=self_cost_cache,
+                    )
+                    div_sum = div_sum + div
+                    margin_loss_sum = margin_loss_sum + torch.clamp(margin - div, min=0.0)
+                    num_pairs += 1
+
+        if num_pairs == 0:
+            return _register_zero_and_return()
+
+        ot_loss = (margin_loss_sum / num_pairs) * ot_coeff
+
+        # Log the mean Sinkhorn divergence (not raw distance) for monitoring.
+        save_to_aux_losses_tracker(
+            "task_ot_sep_loss",
+            (div_sum / num_pairs).detach(),
+            self.layer_number,
+            num_layers,
+            reduce_group=self.tp_cp_group,
+        )
+        if self.calculate_per_token_loss:
+            probs = MoEAuxLossAutoScaler.apply(probs, ot_loss * probs.shape[0])
+        else:
+            probs = MoEAuxLossAutoScaler.apply(probs, ot_loss)
+        return probs
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        task_ids: Optional[torch.Tensor] = None,
+    ):
+        """
+        Forward pass of the router.
+
+        Args:
+            input (torch.Tensor): Input tensor of shape [seq, bsz, hidden] or [T, hidden].
+            task_ids (torch.Tensor, optional): Long tensor of per-token task IDs with shape
+                matching [seq, bsz] or [T].  Must be provided when
+                ``moe_use_task_condition`` is True; silently ignored otherwise.
+        """
+        self._maintain_float32_expert_bias()
+
+        # Apply input jitter
+        input = self.apply_input_jitter(input)
+        logits = self.gating(input)
+        # logits shape: [seq, bsz, E]  →  flatten to [T, E] for alignment
+        logits_2d = logits.reshape(-1, self.config.num_moe_experts)  # [T, E]
+        num_local_tokens = logits_2d.shape[0]
+
+        # ---- Align task_ids to local tokens (TP-aware, done once here) ----
+        task_ids_1d = self._align_task_ids_to_tokens(task_ids, num_local_tokens)
+
+        # ---- Task-conditioned logit correction ----
+        # z_l(x,t) = W_l h_l(x) + b_l^(t)   (bias_only)
+        #          = W_l h_l(x) + b_l^(t) + task_proj(task_emb(t))  (bias_plus_proj)
+        logits_2d = self._apply_task_condition(logits_2d, task_ids_1d)
+        logits = logits_2d.reshape(logits.shape)
+
+        if self.config.moe_router_force_load_balancing:
+            logits = apply_random_logits(logits)
+
+        probs, routing_map = self.routing(logits, task_ids_1d=task_ids_1d)
+
+        return probs, routing_map
+
+    def routing(self, logits: torch.Tensor, task_ids_1d: Optional[torch.Tensor] = None):  # noqa: F811
+        """Top-k routing – receives pre-aligned task_ids_1d for overlap loss."""
+        seq_length, bsz = logits.shape[:2]
+        logits = logits.view(-1, self.config.num_moe_experts)
+
+        logits = self.apply_z_loss(logits)
+
+        if self.routing_type == "sinkhorn":
+            probs, routing_map = self.sinkhorn_load_balancing(logits)
+        else:
+            probs, routing_map = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+                fused=self.config.moe_router_fusion,
+            )
+
+        if self.config.moe_expert_capacity_factor is not None:
+            probs, routing_map = apply_router_token_dropping(
+                probs,
+                routing_map,
+                router_topk=self.topk,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                drop_policy=self.config.moe_token_drop_policy,
+                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+            )
+
+        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+            routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
+                logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
+            )
+            probs = self._apply_aux_loss(probs, scores_for_aux_loss, routing_map_for_aux_loss)
+            probs = self._apply_seq_aux_loss(
+                probs, scores_for_aux_loss, routing_map_for_aux_loss, seq_length, bsz
+            )
+            probs = self._apply_global_aux_loss(
+                probs, scores_for_aux_loss, routing_map_for_aux_loss
+            )
+
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            with torch.no_grad():
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
+
+        # Task overlap loss – task_ids_1d is already aligned to local tokens
+        # by forward() via _align_task_ids_to_tokens(); no further slicing needed.
+        probs = self._apply_task_overlap_loss(probs, routing_map, task_ids_1d)
+
+        # OT-based task separation loss (replaces or complements overlap loss).
+        probs = self._apply_task_ot_sep_loss(probs, routing_map, task_ids_1d)
+
+        return probs, routing_map
+
+    # ------------------------------------------------------------------ #
+    # Old-checkpoint fallback: whitelist missing task keys                #
+    # ------------------------------------------------------------------ #
+
+    # Keys that are allowed to be absent from an old checkpoint.
+    # If absent, they are initialised to their default values instead of
+    # raising a "missing keys" error.
+    _TASK_CONDITION_MISSING_KEY_WHITELIST = frozenset(
+        {
+            "task_bias.weight",
+            "task_emb.weight",
+            "task_proj.weight",
+        }
+    )
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Dict,
+        prefix: str,
+        local_metadata: Dict,
+        strict: bool,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Override to implement whitelist-based missing-key tolerance.
+
+        Only task_bias / task_emb / task_proj weights are allowed to be absent
+        (old checkpoint without task-condition support).  All other missing keys
+        still trigger the standard error path.
+        """
+        # Maintain float32 expert_bias before loading (existing behaviour)
+        self._maintain_float32_expert_bias()
+
+        # Run the standard load_state_dict
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+        # Apply fallback initialisation for whitelisted missing keys and
+        # remove them from the missing_keys list so PyTorch doesn't error.
+        for full_key in list(missing_keys):
+            # full_key looks like "<prefix>task_bias.weight"
+            local_key = full_key[len(prefix):]
+            if local_key in self._TASK_CONDITION_MISSING_KEY_WHITELIST:
+                # Perform default initialisation
+                if local_key == "task_bias.weight" and self.task_bias is not None:
+                    nn.init.zeros_(self.task_bias.weight)
+                elif local_key == "task_emb.weight" and self.task_emb is not None:
+                    nn.init.normal_(self.task_emb.weight, mean=0.0, std=0.02)
+                elif local_key == "task_proj.weight" and self.task_proj is not None:
+                    nn.init.zeros_(self.task_proj.weight)
+                missing_keys.remove(full_key)
+
+    def _save_to_state_dict(self, *args, **kwargs):
+        """Save the state dict of the router."""
+        self._maintain_float32_expert_bias()
+        return super()._save_to_state_dict(*args, **kwargs)

@@ -1,0 +1,17 @@
+# Python 构建产物
+__pycache__/
+*.pyc
+build/
+*.egg-info/
+.eggs/
+dist/
+
+# 冒烟测试输出
+test_smoke/test_merged_smoke_*/
+test_smoke/run_*.log
+test_smoke/.cache/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
